@@ -5,6 +5,14 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 def gauss(sigma,num=None):
+    """
+    Constructs a 2d-gaussian filter with a given standard deviation
+
+    Parameters:
+        sigma: The standard deviation of the gaussian
+        num (optional): Number of coefficients in the filter, will otherwise be automatically determined
+    """
+
     if num is None:
         num=int(4*sigma+1)
         num += num%2+1#make odd
@@ -15,11 +23,31 @@ def gauss(sigma,num=None):
     return G
 
 def rot_mat(theta):
+    """
+    Constructs a simple 2-d rotation matrix from a given angle
+    
+    Parameters:
+        theta: The rotation angle
+    Returns:
+        R: The rotation matrix
+    """
     R = np.array([[np.cos(theta),-np.sin(theta)],
                   [np.sin(theta), np.cos(theta)]])
     return R
 
 def scale_space(im,s=3,sigma_0=1.6,sigma_n=0.5):
+    """
+    Constructs a scale space for an image
+    
+    Parameters:
+        im: The image
+        s: The number of scales per octave (the number of octaves is automatically set)
+        sigma_0: The initial blurring in the first scale
+        sigma_n: Presumed blurring of the original image (typically some anti-aliasing has been done beforehand)
+    Returns:
+        L: The scale space, a list of all the constructed octaves where each octave is a 3d numpy array (scale,width,height) 
+    """
+    #TODO: Should add option to first upsample the image
     G_sigma = gauss((sigma_0**2-sigma_n**2)**(1/2))
     L = []
     im = conv2(im,G_sigma,mode="same")
@@ -33,11 +61,25 @@ def scale_space(im,s=3,sigma_0=1.6,sigma_n=0.5):
         octave[0] = im
         for scale in range(1,s+3):
             octave[scale] = conv2(octave[scale-1],kernels[scale],mode="same")
-        im = octave[s][::2,::2]#TODO: should it really be just nearest neighbour? most higher frequencies are gone but still
+        im = octave[s,::2,::2]#TODO: should it really be just nearest neighbour? most higher frequencies are gone but still
         L.append(octave)
     return L
 
+def taylor_expand(pts,D):
+    """
+    TODO
+    """
+    return pts # TODO: finish this
+
 def eliminate_edges(pts,D,r=10):
+    """
+    Removes all points where the curvature ratio is too sharp, i.e. eliminates edges
+
+    Parameters:
+        pts: The points
+        D: The DoG scale space
+        r (optional): The maximum allowed ratio
+    """
     H_11 = np.array([[0,0,0],
                     [1,-2,1],
                     [0,0,0]])
@@ -57,18 +99,43 @@ def eliminate_edges(pts,D,r=10):
             det = HD_11*HD_22-HD_12**2
             tr = HD_11+HD_22
             edgeness = tr**2/det
+            if det < 0:
+                continue #TODO: This works kind of poorly when not using a taylor expansion of the DoG scale space (a lot of points get rejected)
             if edgeness < T:
                 octave_non_edge_pts.append((s,y,x))
         non_edge_pts.append(octave_non_edge_pts)
     return non_edge_pts
 
+def quadratic_fit(Q,hist,peak,ind_to_center):
+    """
+    """
+    h = hist.take(range(peak-1,peak+2),mode="wrap")#indexing needs to wrap since histogram is periodic
+    (a,b,c) = np.linalg.solve(Q,h)
+    theta_offset = -b/(2*a)
+    theta_diff = ind_to_center[1]-ind_to_center[0]
+    # theta_offset should always be between [-0.5,0.5] since peak is a peak
+    theta = ind_to_center[peak]+theta_diff*theta_offset
+    return theta
+
 def determine_orientation(pts,L,k=2**(1/3),sigma_0=1.6):
+    """
+    Deterimines the main orientation of the points of interest.
+
+    Parameters:
+        pts: The points of interest
+        L: The scale space
+        k: The scaling factor
+        sigma_0: The scale of the most detailed level
+    Returns:
+        pts: The points, now with orientation attached
+    """
     dx = np.array([[1,0,-1]])
     dy = dx.T
     oriented_pts = []
     bins = np.linspace(0,2*np.pi,num=37)
     bin_centers = np.convolve(bins,np.array([1,1]),mode="valid")/2
     ind_to_center = {ind:ctr for ind,ctr in enumerate(bin_centers)}
+    Q = np.array([[1,-1,1],[0,0,1],[1,1,1]])#Matrix for quadratic interpolation
     for o, octave_pts in enumerate(pts):
         octave_oriented_pts = []
         for (s,y,x) in octave_pts:
@@ -85,7 +152,8 @@ def determine_orientation(pts,L,k=2**(1/3),sigma_0=1.6):
             hist,_ = np.histogram(theta,bins=bins,weights=m)
             main_peak = np.argmax(hist)
             #TODO: here quadratic interpolation should be used
-            octave_oriented_pts.append((ind_to_center[main_peak],s,y,x))
+            theta = quadratic_fit(Q,hist,main_peak,ind_to_center)
+            octave_oriented_pts.append((theta,s,y,x))
             # Search for second peak if it exists
             main_val = hist[main_peak]
             peaks = hist == maximum_filter(hist,size=5,mode="wrap")#this should wrap since the histogram is 2pi periodic
@@ -93,11 +161,22 @@ def determine_orientation(pts,L,k=2**(1/3),sigma_0=1.6):
             if np.any(other_peaks):
                 second_val=np.max(hist[other_peaks])
                 second_peak = np.argwhere(np.logical_and(hist==second_val, other_peaks))[0,0]# The "and" here is to make sure that we dont end up selecting a non-peak
-                octave_oriented_pts.append((ind_to_center[second_peak],s,y,x))
+                theta = quadratic_fit(Q,hist,second_peak,ind_to_center)
+                octave_oriented_pts.append((theta,s,y,x))
         oriented_pts.append(octave_oriented_pts)
     return oriented_pts
 
-def trilinear_interpolation(theta,y,x,half_hist_width,m):
+def create_descriptor(theta,y,x,half_hist_width,m):
+    """
+    SIFT Descriptor construction by trilinear histogram binning
+
+    Parameters:
+        theta: The orientation of the gradients
+        y: y-coordinates of the gradients
+        x: x-coordinates of the gradients
+        half_hist_width: width of the histogram in the spatial axii
+
+    """
     descriptor = np.zeros((4,4,8))
     y_bins,x_bins,theta_bins = np.linspace(-half_hist_width,half_hist_width,num=4),np.linspace(-half_hist_width,half_hist_width,num=4),np.linspace(0,2*np.pi,num=9)
     coord_interval = half_hist_width/1.5
@@ -118,12 +197,32 @@ def trilinear_interpolation(theta,y,x,half_hist_width,m):
     return descriptor.flatten()
 
 def normalize_descriptor(descriptor,max_val=0.2):
+    """
+    Normalize the descriptor as done by Lowe et al. (2004)
+
+    Parameters:
+        descriptor: The descriptor
+        max_val(optional): A threshold value
+    Returns:
+        descriptor: The normalized descriptor
+    """
     descriptor /= np.sqrt(np.sum(descriptor**2))
-    descriptor = np.maximum(descriptor,0.2)
+    descriptor = np.minimum(descriptor,0.2)
     descriptor /= np.sqrt(np.sum(descriptor**2))
     return descriptor
 
 def calculate_descriptors(pts,L,k=2**(1/3),sigma_0=1.6):
+    """
+    Creates descriptors for the given points
+
+    Parameters:
+        pts: The points of interest
+        L: The scale space
+        k: The scale factor
+        sigma_0: The smallest scale in the scale space
+    Returns:
+        descriptors: The SIFT descriptors
+    """
     dx = np.array([[1,0,-1]])
     dy = dx.T
     oriented_pts = []
@@ -153,27 +252,56 @@ def calculate_descriptors(pts,L,k=2**(1/3),sigma_0=1.6):
             rot_grid = np.einsum("yx,xmn->ymn",R.T,grid)
             rot_theta = (theta-orientation) % (2*np.pi)
 
-            descriptor = trilinear_interpolation(rot_theta,rot_grid[1],rot_grid[0],half_hist_width,m)
+            descriptor = create_descriptor(rot_theta,rot_grid[1],rot_grid[0],half_hist_width,m)
             descriptor = normalize_descriptor(descriptor)
-            descriptors.append(descriptor)
+            descriptors.append(((2**o*y,2**o*x),descriptor))#Store the coordinates together with the descriptor
     return descriptors
 
 def SIFT(im):
+    """
+    Constructs and returns SIFT descriptors of a given image
+
+    Parameters:
+        im: The image
+    Returns:
+        descriptors: The SIFT descriptors
+    """
     r = 10#from paper, ration between curvature
     L = scale_space(im)
     D = [np.diff(octave,axis=0) for octave in L]
     pts = []
     for D_o in D:
-        M_o=maximum_filter(np.abs(D_o),size=3,mode="constant")
+        M_o=maximum_filter(np.abs(D_o),size=3,mode=('reflect','constant','constant'),cval=np.infty)
         max_inds = (M_o==D_o)&(np.abs(D_o)>0.03)#This theshold depends on the values in the image TODO: should be a parameter
         pts.append(list(zip(*np.nonzero(max_inds))))
+    pts = taylor_expand(pts,D)#TODO: Here a taylor expansion should be done
     pts = eliminate_edges(pts,D)
     pts = determine_orientation(pts,L)
     descriptors = calculate_descriptors(pts,L)
+    return descriptors
 
-    #TODO: Here a quadratic model should be fitted, but skipping it for now
-    print("done")
+def match_descriptors(im1_descriptors,im2_descriptors):
+    rows,cols = len(im1_descriptors),len(im2_descriptors)
+    match = np.zeros((rows,cols))
+    for idx1,desc1 in enumerate(im1_descriptors):
+        for idx2,desc2 in enumerate(im2_descriptors):
+            match[idx1,idx2] = np.sum(desc1[1]*desc2[1])
+    rows_maxes = set(zip(np.arange(rows),np.argmax(match,axis=0)))
+    cols_maxes = set(zip(np.argmax(match,axis=1),np.arange(cols)))
+    good_matches= rows_maxes.intersection(cols_maxes)
+    for row,col in good_matches:
+        y_0,x_0 = im1_descriptors[row][0]
+        y_1,x_1 = im2_descriptors[col][0]
+        plt.plot([x_0,x_1],[y_0,y_1])
+    plt.show()
+    print("hej")
 
-im = Image.open("cameraman.jpg")
-im = np.mean(np.asarray(im),axis=2)/255
-SIFT(im)
+Im = Image.open("cman.tif")
+im = np.array(Im)/255.0
+descriptors = SIFT(im)
+rot_Im = Im.rotate(45)
+plt.imshow(rot_Im)
+plt.show()
+rot_im = np.array(rot_Im)/255.0
+descriptors_rot = SIFT(rot_im)
+match_descriptors(descriptors,descriptors_rot)
